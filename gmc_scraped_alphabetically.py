@@ -1,5 +1,5 @@
-
 import asyncio
+import logging
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 import sqlite3
@@ -12,9 +12,16 @@ import time
 # ---------------- CONFIG ----------------
 BASE_URL = "https://www.gmc-uk.org/registrants/?page={page}&pagesize=50&isSpecialist=true&givenNameText={letter}"
 DB_FILE = "gmc_results.db"
-CONCURRENCY = 5  # Pages scraped in parallel per batch
+CONCURRENCY = 6
 RETRY_LIMIT = 3
+LOG_FILE = "gmc_scraping.log"
 # ----------------------------------------
+
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
