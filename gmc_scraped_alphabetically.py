@@ -10,10 +10,10 @@ from tqdm import tqdm
 import time
 
 # ---------------- CONFIG ----------------
-BASE_URL = "https://www.gmc-uk.org/registrants/?page={page}&pagesize=50&isSpecialist=true&givenNameText={letter}"
-DB_FILE = "gmc_results.db"
+BASE_URL = "https://www.gmc-uk.org/registrants/?page={page}&pagesize=50&isGp=true&givenNameText={letter}"
+DB_FILE = "gp_gmc_results.db"
 CONCURRENCY = 6
-RETRY_LIMIT = 3
+RETRY_LIMIT = 5
 LOG_FILE = "gmc_scraping.log"
 # ----------------------------------------
 
