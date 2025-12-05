@@ -1,4 +1,3 @@
-import sys
 import asyncio
 import csv
 import json
@@ -6,10 +5,13 @@ import logging
 import os
 import re
 import sqlite3
+import sys
+import time
 from typing import List, Dict, Optional
 
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
+from tqdm import tqdm
 
 # ---------------- CONFIG ----------------
 
@@ -20,7 +22,7 @@ HEADLESS = True
 RETRY_LIMIT = 5
 PAGE_TIMEOUT_MS = 60000
 LOG_FILE = "gp_scraper_single.log"
-MAX_CONCURRENT_PAGES = 8  # tune based on your machine/network
+MAX_CONCURRENT_PAGES = 6  # Proven working concurrency from alphabetical scraper
 
 # ----------------------------------------
 
@@ -57,10 +59,8 @@ LABELS = {
     "Specialist Register",
 }
 
-
 def normalize_text(s: str) -> str:
     return re.sub(r"[ \t]+", " ", s)
-
 
 def next_meaningful_line(
     lines: List[str], start_idx: int, stop_labels: Optional[List[str]] = None
@@ -77,7 +77,6 @@ def next_meaningful_line(
         return line
     return None
 
-
 def get_label_value(
     full_text: str, label: str, stop_labels: Optional[List[str]] = None
 ) -> Optional[str]:
@@ -89,25 +88,9 @@ def get_label_value(
                 return val.strip()
     return None
 
-
 def extract_with_regex(text: str, pattern: str) -> Optional[str]:
     m = re.search(pattern, text, flags=re.S | re.I)
     return m.group(1).strip() if m else None
-
-# -------------- PROGRESS BAR HELPER --------------
-
-def print_progress_bar(completed: int, total: int, bar_length: int = 40) -> None:
-    if total == 0:
-        return
-    frac = completed / total
-    filled = int(bar_length * frac)
-    bar = "#" * filled + "-" * (bar_length - filled)
-    percent = frac * 100
-    sys.stdout.write(f"\r[{bar}] {completed}/{total} ({percent:5.1f}%)")
-    sys.stdout.flush()
-    if completed == total:
-        sys.stdout.write("\n")
-        sys.stdout.flush()
 
 # ---------------- PARSER (GP pages) ----------------
 
@@ -222,14 +205,9 @@ def parse_gp_profile(html: str) -> Dict:
 
     return data
 
-
-# ---------------- FLATTENERS (single table) ----------------
+# ---------------- FLATTENERS ----------------
 
 def flatten_history(history: List[Dict[str, str]]) -> str:
-    """
-    Make one CSV-safe cell:
-    "From: | To: | Status: , From: | To: | Status: "
-    """
     if not history:
         return ""
     entries = []
@@ -240,23 +218,17 @@ def flatten_history(history: List[Dict[str, str]]) -> str:
         entries.append(f"From: {from_v} | To: {to_v} | Status: {status_v}")
     return ", ".join(entries)
 
-
 def flatten_specialties(spec_list: Optional[List[str]]) -> str:
-    """
-    Turn a list of specialty strings into one comma-separated cell.
-    """
     if not spec_list:
         return ""
     cleaned = [s.replace("\n", " ").strip() for s in spec_list if isinstance(s, str)]
     return ", ".join(cleaned)
-
 
 def to_single_row(rec: Dict[str, any]) -> Dict[str, any]:
     gp = rec.get("GP_Register") or {}
     spec = rec.get("Specialist_Register") or {}
     history_flat = flatten_history(rec.get("Registration_History") or [])
     specialties_flat = flatten_specialties(spec.get("Specialties"))
-
     return {
         "GMC_Number": rec.get("GMC_Number"),
         "Name": rec.get("Name"),
@@ -276,8 +248,7 @@ def to_single_row(rec: Dict[str, any]) -> Dict[str, any]:
         "Profile_URL": rec.get("Profile_URL"),
     }
 
-
-# ---------------- DB URL LOADER ----------------
+# ---------------- DB LOADER ----------------
 
 def load_target_urls_from_db(db_path: str) -> List[str]:
     conn = sqlite3.connect(db_path)
@@ -295,45 +266,48 @@ def load_target_urls_from_db(db_path: str) -> List[str]:
     finally:
         conn.close()
 
+# ---------------- SAFETY SCRAPER (from alphabetical scraper) ----------------
 
-# ---------------- SCRAPER ----------------
-
-async def fetch_page_html(context, url: str) -> Optional[str]:
-    for attempt in range(1, RETRY_LIMIT + 1):
+async def scrape_profile_page(context, url: str) -> Optional[str]:
+    """Proven scraper from gmc_scraped_alphabetically.py"""
+    for attempt in range(RETRY_LIMIT):
         page = await context.new_page()
         try:
             await page.goto(url, timeout=PAGE_TIMEOUT_MS)
-            await page.wait_for_timeout(1200)
+            await page.wait_for_timeout(2000)  # Increased from 1200
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await page.wait_for_timeout(600)
+            await page.wait_for_timeout(1000)  # Increased from 600
             html = await page.content()
+            await page.close()
 
-            if any(
-                k in html.lower()
-                for k in ("captcha", "verify", "blocked", "unusual activity")
-            ):
-                logging.warning(
-                    f"Verification hinted on {url}. Attempt {attempt}/{RETRY_LIMIT}"
-                )
-                await page.close()
-                await asyncio.sleep(3 * attempt)
+            # GMC-specific verification checks (expanded)
+            if any(keyword in html.lower() for keyword in ["verify", "captcha", "blocked", "unusual activity"]):
+                print(f"⚠ Verification detected on {url}. Retrying ({attempt+1}/{RETRY_LIMIT})...")
+                await asyncio.sleep(5 * (attempt + 1))
                 continue
 
-            await page.close()
-            return html
+            # Check if we got meaningful content
+            if parse_gp_profile(html)["GMC_Number"]:  # Quick validity check
+                return html
+            else:
+                print(f"⚠ No data found on {url}. Retrying ({attempt+1}/{RETRY_LIMIT})...")
+                await asyncio.sleep(3 * (attempt + 1))
+                continue
 
         except Exception as e:
-            logging.error(f"Error fetching {url} (attempt {attempt}): {e}")
+            print(f"Error loading {url}: {e}. Retrying ({attempt+1}/{RETRY_LIMIT})...")
             try:
                 if not page.is_closed():
                     await page.close()
-            except Exception:
+            except:
                 pass
-            await asyncio.sleep(3 * attempt)
+            await asyncio.sleep(3 * (attempt + 1))
 
-    logging.error(f"Failed to fetch {url} after {RETRY_LIMIT} attempts")
+    print(f"❌ Failed to scrape {url} after {RETRY_LIMIT} attempts.")
+    logging.error(f"Failed to scrape {url} after {RETRY_LIMIT} attempts.")
     return None
 
+# ---------------- CONCURRENT SCRAPER ----------------
 
 async def scrape_profiles(urls: List[str]) -> List[Dict]:
     total = len(urls)
@@ -342,8 +316,6 @@ async def scrape_profiles(urls: List[str]) -> List[Dict]:
 
     results: List[Dict] = []
     results_lock = asyncio.Lock()
-    progress_lock = asyncio.Lock()
-    completed = 0
     sem = asyncio.Semaphore(MAX_CONCURRENT_PAGES)
 
     async with async_playwright() as p:
@@ -358,42 +330,42 @@ async def scrape_profiles(urls: List[str]) -> List[Dict]:
             timezone_id="Europe/London",
         )
 
+        # Proven resource blocking from alphabetical scraper
         await context.route(
             "**/*",
-            lambda route: (
-                route.abort()
-                if route.request.resource_type in {"image", "font", "media"}
-                else route.continue_()
-            ),
+            lambda route: route.abort() if route.request.resource_type in ["image", "font", "media"] else route.continue_()
         )
 
-        # initial bar
-        print_progress_bar(0, total)
+        # tqdm progress bar (proven from alphabetical scraper)
+        progress = tqdm(total=total, desc="Scraping GP Profiles", unit="profile")
+        start_time = time.time()
 
         async def worker(url: str):
-            nonlocal completed
             async with sem:
-                html = await fetch_page_html(context, url)
+                html = await scrape_profile_page(context, url)
                 if html:
                     parsed = parse_gp_profile(html)
                     parsed["Profile_URL"] = url
                     async with results_lock:
                         results.append(parsed)
-                else:
-                    logging.error(f"No HTML for {url}")
-
-                async with progress_lock:
-                    completed += 1
-                    print_progress_bar(completed, total)
+                progress.update(1)
+                
+                # Dynamic ETA
+                elapsed = time.time() - start_time
+                avg_time = elapsed / progress.n if progress.n > 0 else 0
+                remaining = total - progress.n
+                eta = remaining * avg_time / 60  # minutes
+                progress.set_postfix({"ETA": f"{eta:.1f}min"})
 
         tasks = [asyncio.create_task(worker(u)) for u in urls]
         await asyncio.gather(*tasks)
 
         await browser.close()
+        progress.close()
 
     return results
 
-# ---------------- WRITERS (CSV + SQLite single table) ----------------
+# ---------------- WRITERS ----------------
 
 def write_csv(rows: List[Dict[str, any]], out_csv: str) -> None:
     if not rows:
@@ -401,91 +373,47 @@ def write_csv(rows: List[Dict[str, any]], out_csv: str) -> None:
         return
     fieldnames = list(rows[0].keys())
     with open(out_csv, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(
-            f, fieldnames=fieldnames, quoting=csv.QUOTE_MINIMAL
-        )
+        writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_MINIMAL)
         writer.writeheader()
         for r in rows:
             writer.writerow(r)
     print(f"CSV written: {out_csv}")
 
-
 def write_sqlite(rows: List[Dict[str, any]], out_db: str) -> None:
     conn = sqlite3.connect(out_db)
     cur = conn.cursor()
-    cur.execute(
-        """
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS doctors_single (
             GMC_Number TEXT PRIMARY KEY,
-            Name TEXT,
-            Licence_Status TEXT,
-            Profession TEXT,
-            Gender TEXT,
-            Registered_Qualification TEXT,
-            Full_Registration_Date TEXT,
-            Annual_Fee_Due TEXT,
-            Designated_Body TEXT,
-            Responsible_Officer TEXT,
-            On_GP_Register INTEGER,
-            GP_Since TEXT,
-            On_Specialist_Register INTEGER,
-            Specialties_Flat TEXT,
-            Registration_History_Flat TEXT,
+            Name TEXT, Licence_Status TEXT, Profession TEXT, Gender TEXT,
+            Registered_Qualification TEXT, Full_Registration_Date TEXT, Annual_Fee_Due TEXT,
+            Designated_Body TEXT, Responsible_Officer TEXT, On_GP_Register INTEGER, GP_Since TEXT,
+            On_Specialist_Register INTEGER, Specialties_Flat TEXT, Registration_History_Flat TEXT,
             Profile_URL TEXT
         )
-        """
-    )
-
+    """)
     for r in rows:
-        cur.execute(
-            """
-            INSERT INTO doctors_single (
-                GMC_Number, Name, Licence_Status, Profession, Gender,
-                Registered_Qualification, Full_Registration_Date, Annual_Fee_Due,
-                Designated_Body, Responsible_Officer, On_GP_Register, GP_Since,
-                On_Specialist_Register, Specialties_Flat, Registration_History_Flat, Profile_URL
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        cur.execute("""
+            INSERT INTO doctors_single VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(GMC_Number) DO UPDATE SET
-                Name=excluded.Name,
-                Licence_Status=excluded.Licence_Status,
-                Profession=excluded.Profession,
-                Gender=excluded.Gender,
+                Name=excluded.Name, Licence_Status=excluded.Licence_Status,
+                Profession=excluded.Profession, Gender=excluded.Gender,
                 Registered_Qualification=excluded.Registered_Qualification,
-                Full_Registration_Date=excluded.Full_Registration_Date,
-                Annual_Fee_Due=excluded.Annual_Fee_Due,
-                Designated_Body=excluded.Designated_Body,
-                Responsible_Officer=excluded.Responsible_Officer,
-                On_GP_Register=excluded.On_GP_Register,
-                GP_Since=excluded.GP_Since,
-                On_Specialist_Register=excluded.On_Specialist_Register,
-                Specialties_Flat=excluded.Specialties_Flat,
-                Registration_History_Flat=excluded.Registration_History_Flat,
-                Profile_URL=excluded.Profile_URL
-            """,
-            (
-                r.get("GMC_Number"),
-                r.get("Name"),
-                r.get("Licence_Status"),
-                r.get("Profession"),
-                r.get("Gender"),
-                r.get("Registered_Qualification"),
-                r.get("Full_Registration_Date"),
-                r.get("Annual_Fee_Due"),
-                r.get("Designated_Body"),
-                r.get("Responsible_Officer"),
-                r.get("On_GP_Register"),
-                r.get("GP_Since"),
-                r.get("On_Specialist_Register"),
-                r.get("Specialties_Flat"),
-                r.get("Registration_History_Flat"),
-                r.get("Profile_URL"),
-            ),
-        )
-
+                Full_Registration_Date=excluded.Full_Registration_Date, Annual_Fee_Due=excluded.Annual_Fee_Due,
+                Designated_Body=excluded.Designated_Body, Responsible_Officer=excluded.Responsible_Officer,
+                On_GP_Register=excluded.On_GP_Register, GP_Since=excluded.GP_Since,
+                On_Specialist_Register=excluded.On_Specialist_Register, Specialties_Flat=excluded.Specialties_Flat,
+                Registration_History_Flat=excluded.Registration_History_Flat, Profile_URL=excluded.Profile_URL
+        """, (
+            r.get("GMC_Number"), r.get("Name"), r.get("Licence_Status"), r.get("Profession"),
+            r.get("Gender"), r.get("Registered_Qualification"), r.get("Full_Registration_Date"),
+            r.get("Annual_Fee_Due"), r.get("Designated_Body"), r.get("Responsible_Officer"),
+            r.get("On_GP_Register"), r.get("GP_Since"), r.get("On_Specialist_Register"),
+            r.get("Specialties_Flat"), r.get("Registration_History_Flat"), r.get("Profile_URL")
+        ))
     conn.commit()
     conn.close()
     print(f"SQLite written: {out_db}")
-
 
 # ---------------- MAIN ----------------
 
@@ -500,10 +428,7 @@ async def main():
     single_rows = [to_single_row(r) for r in parsed]
     write_csv(single_rows, OUT_CSV)
     write_sqlite(single_rows, OUT_SQLITE)
-    print(
-        f"Scraped {len(single_rows)} GP profiles. "
-        f"Saved to {OUT_CSV} and {OUT_SQLITE}"
-    )
+    print(f"✅ Scraped {len(single_rows)} GP profiles. Saved to {OUT_CSV} and {OUT_SQLITE}")
 
 if __name__ == "__main__":
     asyncio.run(main())
