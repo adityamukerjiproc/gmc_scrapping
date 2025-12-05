@@ -1,3 +1,4 @@
+import sys
 import asyncio
 import csv
 import json
@@ -19,7 +20,7 @@ HEADLESS = True
 RETRY_LIMIT = 5
 PAGE_TIMEOUT_MS = 60000
 LOG_FILE = "gp_scraper_single.log"
-MAX_CONCURRENT_PAGES = 8  
+MAX_CONCURRENT_PAGES = 8  # tune based on your machine/network
 
 # ----------------------------------------
 
@@ -93,6 +94,20 @@ def extract_with_regex(text: str, pattern: str) -> Optional[str]:
     m = re.search(pattern, text, flags=re.S | re.I)
     return m.group(1).strip() if m else None
 
+# -------------- PROGRESS BAR HELPER --------------
+
+def print_progress_bar(completed: int, total: int, bar_length: int = 40) -> None:
+    if total == 0:
+        return
+    frac = completed / total
+    filled = int(bar_length * frac)
+    bar = "#" * filled + "-" * (bar_length - filled)
+    percent = frac * 100
+    sys.stdout.write(f"\r[{bar}] {completed}/{total} ({percent:5.1f}%)")
+    sys.stdout.flush()
+    if completed == total:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
 # ---------------- PARSER (GP pages) ----------------
 
@@ -352,6 +367,9 @@ async def scrape_profiles(urls: List[str]) -> List[Dict]:
             ),
         )
 
+        # initial bar
+        print_progress_bar(0, total)
+
         async def worker(url: str):
             nonlocal completed
             async with sem:
@@ -366,7 +384,7 @@ async def scrape_profiles(urls: List[str]) -> List[Dict]:
 
                 async with progress_lock:
                     completed += 1
-                    print(f"Progress: {completed}/{total} ({completed*100/total:.1f}%)")
+                    print_progress_bar(completed, total)
 
         tasks = [asyncio.create_task(worker(u)) for u in urls]
         await asyncio.gather(*tasks)
