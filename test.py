@@ -277,7 +277,6 @@ def load_target_urls_from_db(db_path: str) -> List[str]:
         FROM gmc_data
         WHERE Profile_URL IS NOT NULL
         AND Registration_Status = 'Registered with a licence to practise'
-        LIMIT 5
         """
         cur = conn.cursor()
         cur.execute(query)
