@@ -1,8 +1,6 @@
 import asyncio
 import csv
-import json
 import logging
-import os
 import re
 import sqlite3
 import sys
@@ -15,14 +13,14 @@ from tqdm import tqdm
 
 # ---------------- CONFIG ----------------
 
-DB_PATH = "gp_gmc_results.db"
-OUT_CSV = "gmc_doctors_single.csv"
-OUT_SQLITE = "gmc_doctors_single.sqlite"
+DB_PATH = "sp_gmc_results.db"
+OUT_CSV = "gmc_specialists_single.csv"
+OUT_SQLITE = "gmc_specialists_single.sqlite"
 HEADLESS = True
 RETRY_LIMIT = 5
 PAGE_TIMEOUT_MS = 60000
-LOG_FILE = "gp_scraper_single.log"
-MAX_CONCURRENT_PAGES = 6  # Proven working concurrency from alphabetical scraper
+LOG_FILE = "sp_scraper_single.log"
+MAX_CONCURRENT_PAGES = 6
 
 # ----------------------------------------
 
@@ -92,7 +90,25 @@ def extract_with_regex(text: str, pattern: str) -> Optional[str]:
     m = re.search(pattern, text, flags=re.S | re.I)
     return m.group(1).strip() if m else None
 
-# ---------------- PARSER (GP pages) ----------------
+# ---------------- SPECIALTIES PARSER (BRACKETED FORMAT) ----------------
+
+def parse_specialties(soup: BeautifulSoup) -> List[str]:
+    """Extract FULL 'Specialty from DATE' in brackets"""
+    specs = []
+    
+    # Find the exact speciality-list container
+    speciality_list = soup.find('ul', class_='speciality-list')
+    if speciality_list:
+        for li in speciality_list.find_all('li'):
+            span = li.find('span')
+            if span:
+                full_text = span.get_text(strip=True)
+                if 'from' in full_text.lower():
+                    specs.append(f"[{full_text}]")
+
+    return specs
+
+# ---------------- PARSER (Specialist pages) ----------------
 
 def parse_gp_profile(html: str) -> Dict:
     soup = BeautifulSoup(html, "html.parser")
@@ -132,9 +148,12 @@ def parse_gp_profile(html: str) -> Dict:
         "Since": since if on_gp else None,
     }
 
-    # Specialist Register flag (future proof)
+    # Specialist Register with bracketed specialties
+    specialties = parse_specialties(soup)
+    on_spec = "This doctor is on the Specialist Register" in full_text or bool(specialties)
     data["Specialist_Register"] = {
-        "On_Register": "This doctor is on the Specialist Register" in full_text
+        "On_Register": bool(on_spec),
+        "Specialties": specialties,
     }
 
     # Profession
@@ -221,14 +240,14 @@ def flatten_history(history: List[Dict[str, str]]) -> str:
 def flatten_specialties(spec_list: Optional[List[str]]) -> str:
     if not spec_list:
         return ""
-    cleaned = [s.replace("\n", " ").strip() for s in spec_list if isinstance(s, str)]
-    return ", ".join(cleaned)
+    return " ".join(spec_list)  # [A] [B] [C] format
 
 def to_single_row(rec: Dict[str, any]) -> Dict[str, any]:
     gp = rec.get("GP_Register") or {}
     spec = rec.get("Specialist_Register") or {}
     history_flat = flatten_history(rec.get("Registration_History") or [])
     specialties_flat = flatten_specialties(spec.get("Specialties"))
+
     return {
         "GMC_Number": rec.get("GMC_Number"),
         "Name": rec.get("Name"),
@@ -243,7 +262,7 @@ def to_single_row(rec: Dict[str, any]) -> Dict[str, any]:
         "On_GP_Register": 1 if gp.get("On_Register") else 0,
         "GP_Since": gp.get("Since") or "",
         "On_Specialist_Register": 1 if spec.get("On_Register") else 0,
-        "Specialties_Flat": specialties_flat or "",
+        "Specialties_Flat": specialties_flat,
         "Registration_History_Flat": history_flat,
         "Profile_URL": rec.get("Profile_URL"),
     }
@@ -256,41 +275,48 @@ def load_target_urls_from_db(db_path: str) -> List[str]:
         query = """
         SELECT DISTINCT Profile_URL
         FROM gmc_data
-        WHERE Registration_Status = 'Registered with a licence to practise'
-          AND Profile_URL IS NOT NULL
+        WHERE Profile_URL IS NOT NULL
+        AND Registration_Status = 'Registered with a licence to practise'
+        LIMIT 5
         """
         cur = conn.cursor()
         cur.execute(query)
         rows = cur.fetchall()
-        return [r[0] for r in rows if r[0]]
+        urls = []
+        for r in rows:
+            url = r[0]
+            if not url:
+                continue
+            if url.startswith("/"):
+                url = "https://www.gmc-uk.org" + url
+            urls.append(url)
+        return urls
     finally:
         conn.close()
 
-# ---------------- SAFETY SCRAPER (from alphabetical scraper) ----------------
+# ---------------- SAFETY SCRAPER ----------------
 
 async def scrape_profile_page(context, url: str) -> Optional[str]:
-    """Proven scraper from gmc_scraped_alphabetically.py"""
     for attempt in range(RETRY_LIMIT):
         page = await context.new_page()
         try:
             await page.goto(url, timeout=PAGE_TIMEOUT_MS)
-            await page.wait_for_timeout(2000)  # Increased from 1200
+            await page.wait_for_timeout(2000)
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await page.wait_for_timeout(1000)  # Increased from 600
+            await page.wait_for_timeout(1000)
             html = await page.content()
             await page.close()
 
-            # GMC-specific verification checks (expanded)
             if any(keyword in html.lower() for keyword in ["verify", "captcha", "blocked", "unusual activity"]):
-                print(f"⚠ Verification detected on {url}. Retrying ({attempt+1}/{RETRY_LIMIT})...")
+                print(f"Verification detected on {url}. Retrying ({attempt+1}/{RETRY_LIMIT})...")
                 await asyncio.sleep(5 * (attempt + 1))
                 continue
 
-            # Check if we got meaningful content
-            if parse_gp_profile(html)["GMC_Number"]:  # Quick validity check
+            parsed = parse_gp_profile(html)
+            if parsed.get("GMC_Number"):
                 return html
             else:
-                print(f"⚠ No data found on {url}. Retrying ({attempt+1}/{RETRY_LIMIT})...")
+                print(f"No data found on {url}. Retrying ({attempt+1}/{RETRY_LIMIT})...")
                 await asyncio.sleep(3 * (attempt + 1))
                 continue
 
@@ -299,11 +325,11 @@ async def scrape_profile_page(context, url: str) -> Optional[str]:
             try:
                 if not page.is_closed():
                     await page.close()
-            except:
+            except Exception:
                 pass
             await asyncio.sleep(3 * (attempt + 1))
 
-    print(f"❌ Failed to scrape {url} after {RETRY_LIMIT} attempts.")
+    print(f"Failed to scrape {url} after {RETRY_LIMIT} attempts.")
     logging.error(f"Failed to scrape {url} after {RETRY_LIMIT} attempts.")
     return None
 
@@ -330,14 +356,14 @@ async def scrape_profiles(urls: List[str]) -> List[Dict]:
             timezone_id="Europe/London",
         )
 
-        # Proven resource blocking from alphabetical scraper
         await context.route(
             "**/*",
-            lambda route: route.abort() if route.request.resource_type in ["image", "font", "media"] else route.continue_()
+            lambda route: route.abort()
+            if route.request.resource_type in ["image", "font", "media"]
+            else route.continue_(),
         )
 
-        # tqdm progress bar (proven from alphabetical scraper)
-        progress = tqdm(total=total, desc="Scraping GP Profiles", unit="profile")
+        progress = tqdm(total=total, desc="Scraping Specialist Profiles", unit="profile")
         start_time = time.time()
 
         async def worker(url: str):
@@ -349,12 +375,10 @@ async def scrape_profiles(urls: List[str]) -> List[Dict]:
                     async with results_lock:
                         results.append(parsed)
                 progress.update(1)
-                
-                # Dynamic ETA
                 elapsed = time.time() - start_time
                 avg_time = elapsed / progress.n if progress.n > 0 else 0
                 remaining = total - progress.n
-                eta = remaining * avg_time / 60  # minutes
+                eta = remaining * avg_time / 60
                 progress.set_postfix({"ETA": f"{eta:.1f}min"})
 
         tasks = [asyncio.create_task(worker(u)) for u in urls]
@@ -428,7 +452,7 @@ async def main():
     single_rows = [to_single_row(r) for r in parsed]
     write_csv(single_rows, OUT_CSV)
     write_sqlite(single_rows, OUT_SQLITE)
-    print(f"✅ Scraped {len(single_rows)} GP profiles. Saved to {OUT_CSV} and {OUT_SQLITE}")
+    print(f"Scraped {len(single_rows)} specialist profiles. Saved to {OUT_CSV} and {OUT_SQLITE}")
 
 if __name__ == "__main__":
     asyncio.run(main())

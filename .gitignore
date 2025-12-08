@@ -1,3 +1,5 @@
 # Ignore database and parquet files
 *.db
 *.parquet
+*.sqlite
+*.csv
