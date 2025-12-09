@@ -19,7 +19,7 @@ OUT_SQLITE = "gmc_specialists_single.sqlite"
 HEADLESS = True
 RETRY_LIMIT = 5
 PAGE_TIMEOUT_MS = 60000
-LOG_FILE = "sp_scraper_single.log"
+LOG_FILE = "gmc_scraper_log.log"
 MAX_CONCURRENT_PAGES = 6
 
 # ----------------------------------------
