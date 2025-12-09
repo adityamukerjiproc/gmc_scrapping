@@ -13,9 +13,9 @@ from tqdm import tqdm
 
 # ---------------- CONFIG ----------------
 
-DB_PATH = "sp_gmc_results.db"
-OUT_CSV = "gmc_specialists_single.csv"
-OUT_SQLITE = "gmc_specialists_single.sqlite"
+DB_PATH = "missed_gmc_numbers.csv"
+OUT_CSV = "missed_gmc.csv"
+OUT_SQLITE = "missed_gmc.sqlite"
 HEADLESS = True
 RETRY_LIMIT = 5
 PAGE_TIMEOUT_MS = 60000
@@ -268,28 +268,88 @@ def to_single_row(rec: Dict[str, any]) -> Dict[str, any]:
     }
 
 # ---------------- DB LOADER ----------------
+import os
+import csv
+import sqlite3
+from typing import List
 
 def load_target_urls_from_db(db_path: str) -> List[str]:
+    """
+    Returns a list of URLs. If db_path points to a CSV file, it will read the 'Profile_URL'
+    column from that CSV. Otherwise, it will query the SQLite DB as before.
+
+    CSV expectation:
+      - Header includes 'Profile_URL'
+      - One URL per row, e.g.:
+            Profile_URL
+            https://www.gmc-uk.org/registrants/4253905
+            /registrants/3658437
+    """
+
+    def _normalize(url: str) -> str:
+        """Normalize relative GMC URLs to absolute; strip whitespace."""
+        if not url:
+            return ""
+        url = url.strip()
+        if url.startswith("/"):
+            return "https://www.gmc-uk.org" + url
+        return url
+
+    def _unique_preserve_order(items: List[str]) -> List[str]:
+        """Deduplicate while preserving order."""
+        seen = set()
+        out = []
+        for x in items:
+            x = x.strip()
+            if x and x not in seen:
+                seen.add(x)
+                out.append(x)
+        return out
+
+    # --- Path exists check ---
+    if not os.path.isfile(db_path):
+        # Graceful empty result on missing file (keeps function contract unchanged)
+        return []
+
+    # --- If CSV: read 'Profile_URL' column ---
+    _, ext = os.path.splitext(db_path.lower())
+    if ext == ".csv":
+        urls: List[str] = []
+        with open(db_path, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            # Ensure column exists; if not, return empty to keep behavior predictable
+            if "Profile_URL" not in (reader.fieldnames or []):
+                return []
+            for row in reader:
+                url = row.get("Profile_URL")
+                if not url:
+                    continue
+                url = _normalize(url)
+                if url:
+                    urls.append(url)
+        return _unique_preserve_order(urls)
+
+    # --- Fallback: original SQLite DB logic ---
     conn = sqlite3.connect(db_path)
     try:
         query = """
-        SELECT DISTINCT Profile_URL
-        FROM gmc_data
-        WHERE Profile_URL IS NOT NULL
-        AND Registration_Status = 'Registered with a licence to practise'
+            SELECT DISTINCT Profile_URL
+            FROM gmc_data
+            WHERE Profile_URL IS NOT NULL
+              AND Registration_Status = 'Registered with a licence to practise'
         """
         cur = conn.cursor()
         cur.execute(query)
         rows = cur.fetchall()
-        urls = []
+        urls: List[str] = []
         for r in rows:
             url = r[0]
             if not url:
                 continue
-            if url.startswith("/"):
-                url = "https://www.gmc-uk.org" + url
-            urls.append(url)
-        return urls
+            url = _normalize(url)
+            if url:
+                urls.append(url)
+        return _unique_preserve_order(urls)
     finally:
         conn.close()
 
